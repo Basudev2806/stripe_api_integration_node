@@ -213,7 +213,22 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// Register API with Stripe customer ID
+/**
+ * @api {post} /register Register a new user
+ * @apiName RegisterUser
+ * @apiGroup User
+ * @apiDescription Creates a new user account with Stripe customer integration
+ * 
+ * @apiBody {String} email User's email address
+ * @apiBody {String} password User's password (will be hashed)
+ * 
+ * @apiSuccess {String} message Success message
+ * @apiSuccess {Object} user User information
+ * @apiSuccess {String} user.email User's email address
+ * @apiSuccess {String} user.customerId Stripe customer ID
+ * 
+ * @apiError {String} message Error message
+ */
 app.post('/register', async (req, res) => {
   const { email, password } = req.body;
   try {
@@ -243,7 +258,25 @@ app.post('/register', async (req, res) => {
   }
 });
 
-// Login API with JWT access token
+/**
+ * @api {post} /login User login
+ * @apiName LoginUser
+ * @apiGroup User
+ * @apiDescription Authenticates a user and returns a JWT token
+ * 
+ * @apiBody {String} email User's email address
+ * @apiBody {String} password User's password
+ * 
+ * @apiSuccess {String} message Success message
+ * @apiSuccess {String} token JWT authentication token
+ * @apiSuccess {Object} user User information
+ * @apiSuccess {String} user.email User's email address
+ * @apiSuccess {String} user.customerId Stripe customer ID
+ * @apiSuccess {Boolean} user.isAdmin Whether user has admin privileges
+ * @apiSuccess {Boolean} user.hasSubscription Whether user has an active subscription
+ * 
+ * @apiError {String} message Error message
+ */
 app.post('/login', async (req, res) => {
   const { email, password } = req.body;
   try {
