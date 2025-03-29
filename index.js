@@ -1,6 +1,5 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const bodyParser = require('body-parser');
 const dotenv = require('dotenv');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -8,11 +7,31 @@ const stripe = require('stripe');
 const User = require('./models/User');
 const SubscriptionPlan = require('./models/SubscriptionPlan');
 const DeletedUserFeedback = require('./models/DeletedUserFeedback');
+const { promisify } = require('util');
 
 dotenv.config();
 
 const app = express();
 const stripeClient = stripe(process.env.STRIPE_SECRET_KEY);
+
+// Initialize Redis client
+const redisClient = redis.createClient(process.env.REDIS_URI || 'redis://redis:6379');
+
+// Promisify Redis commands
+const redisGet = promisify(redisClient.get).bind(redisClient);
+const redisSet = promisify(redisClient.set).bind(redisClient);
+const redisDel = promisify(redisClient.del).bind(redisClient);
+const redisExpire = promisify(redisClient.expire).bind(redisClient);
+const redisKeys = promisify(redisClient.keys).bind(redisClient);
+
+// Handle Redis connection events
+redisClient.on('connect', () => {
+  console.log('Connected to Redis server');
+});
+
+redisClient.on('error', (err) => {
+  console.error('Redis error:', err);
+});
 
 // 1. Define the webhook route BEFORE anybody parsing middleware
 app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) => {
@@ -48,36 +67,45 @@ app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) =
      switch (event.type) {
       case 'payment_intent.succeeded':
         console.log('Processing payment_intent.succeeded event');
-        const paymentIntent = event.data.object;
+        await handleSuccessfulPayment(event.data.object);
         
-        await handleSuccessfulPayment(paymentIntent);
+        // Check for wallet payment method
+        const paymentMethod = event.data.object.payment_method_details?.type || 'unknown';
+        console.log(`Payment made with: ${paymentMethod}`);
+        
+        // Record which wallet was used if applicable
+        if (paymentMethod === 'card' && event.data.object.payment_method_details?.card?.wallet) {
+          const wallet = event.data.object.payment_method_details.card.wallet.type;
+          console.log(`Payment made with wallet: ${wallet}`);
+          // You could store this information in your database
+        }
         
         // Additionally update any associated order
-        if (paymentIntent.metadata && paymentIntent.metadata.orderId) {
-          console.log('Payment has associated order:', paymentIntent.metadata.orderId);
-          console.log('Payment metadata:', paymentIntent.metadata);
+        if (event.data.object.metadata && event.data.object.metadata.orderId) {
+          console.log('Payment has associated order:', event.data.object.metadata.orderId);
+          console.log('Payment metadata:', event.data.object.metadata);
           
           // Get userId from the metadata or try to find the user by customerId
-          let userId = paymentIntent.metadata.userId;
+          let userId = event.data.object.metadata.userId;
           
-          if (!userId && paymentIntent.customer) {
+          if (!userId && event.data.object.customer) {
             // Try to find the user by customerId
-            const user = await User.findOne({ customerId: paymentIntent.customer });
+            const user = await User.findOne({ customerId: event.data.object.customer });
             if (user) {
               userId = user._id.toString();
-              console.log(`Found user ${userId} by customerId ${paymentIntent.customer}`);
+              console.log(`Found user ${userId} by customerId ${event.data.object.customer}`);
             }
           }
           
           if (userId) {
             await updateOrderStatus(
               userId,
-              paymentIntent.metadata.orderId, 
+              event.data.object.metadata.orderId, 
               'completed', 
               'succeeded'
             );
           } else {
-            console.error(`No userId found for order ${paymentIntent.metadata.orderId}`);
+            console.error(`No userId found for order ${event.data.object.metadata.orderId}`);
           }
         }
         break;
@@ -397,7 +425,7 @@ app.post('/process-payment', authenticateToken, async (req, res) => {
 });
 
 // Saved card list API with Stripe
-app.get('/cards', authenticateToken, async (req, res) => {
+app.get('/cards', authenticateToken,  async (req, res) => {
   try {
     const paymentMethods = await stripeClient.paymentMethods.list({
       customer: req.user.customerId,
@@ -826,8 +854,8 @@ app.get('/verify-payment/:paymentIntentId', authenticateToken, async (req, res) 
   }
 });
 
-// Get payment history API
-app.get('/payment-history', authenticateToken, async (req, res) => {
+// Get payment history API with caching
+app.get('/payment-history', authenticateToken,  async (req, res) => {
   try {
     const user = await User.findById(req.user.userId);
     if (!user) {
@@ -2527,8 +2555,8 @@ app.post('/user/seed-default-plan', authenticateToken, async (req, res) => {
   }
 });
 
-// Get user invoices API
-app.get('/invoices', authenticateToken, async (req, res) => {
+// Get user invoices API with caching
+app.get('/invoices', authenticateToken,  async (req, res) => {
   try {
     const user = await User.findById(req.user.userId);
     if (!user) {
@@ -2567,17 +2595,7 @@ app.get('/invoices', authenticateToken, async (req, res) => {
       receiptUrl: invoice.charge ? invoice.charge.receipt_url : null,
       hostedInvoiceUrl: invoice.hosted_invoice_url,
       pdf: invoice.invoice_pdf,
-      isSubscription: !!invoice.subscription,
-      lines: invoice.lines.data.map(line => ({
-        description: line.description,
-        amount: line.amount / 100,
-        quantity: line.quantity,
-        period: line.period ? {
-          start: new Date(line.period.start * 1000),
-          end: new Date(line.period.end * 1000)
-        } : null,
-        proration: line.proration
-      }))
+      isSubscription: !!invoice.subscription
     }));
 
     res.status(200).json({
@@ -3853,6 +3871,242 @@ app.get('/admin/dashboard/revenue', authenticateToken, async (req, res) => {
   }
 });
 
+// Create a Payment Intent with multiple payment method options
+app.post('/create-payment-intent-multi', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      amount, 
+      currency = 'usd', 
+      description,
+      paymentMethods = ['card', 'apple_pay', 'google_pay', 'amazon_pay'],
+      metadata = {},
+      shippingOptions = []
+    } = req.body;
+
+    // Validate required fields
+    if (!amount) {
+      return res.status(400).json({ message: 'Amount is required' });
+    }
+    
+    // Convert amount to cents if it's not already
+    const amountInCents = Number.isInteger(amount) ? amount : Math.round(amount * 100);
+    
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Configure payment methods
+    const paymentMethodTypes = [];
+    const paymentMethodOptions = {};
+    
+    // Add payment methods based on what's requested
+    if (paymentMethods.includes('card')) {
+      paymentMethodTypes.push('card');
+    }
+    
+    if (paymentMethods.includes('apple_pay')) {
+      if (!paymentMethodTypes.includes('card')) {
+        paymentMethodTypes.push('card'); // Apple Pay requires card payment method
+      }
+      paymentMethodOptions.card = {
+        ...paymentMethodOptions.card,
+        apple_pay: { merchantCountryCode: 'US' } // Replace with your country code
+      };
+    }
+    
+    if (paymentMethods.includes('google_pay')) {
+      if (!paymentMethodTypes.includes('card')) {
+        paymentMethodTypes.push('card'); // Google Pay requires card payment method
+      }
+      paymentMethodOptions.card = {
+        ...paymentMethodOptions.card,
+        google_pay: { merchantCountryCode: 'US' } // Replace with your country code
+      };
+    }
+    
+    if (paymentMethods.includes('amazon_pay')) {
+      // Amazon Pay currently works via redirects since it's not directly integrated
+      // with Stripe's payment methods
+      paymentMethodTypes.push('card');
+      metadata.amazon_pay_enabled = 'true'; // You'll handle Amazon Pay in your frontend
+    }
+
+    // Create payment intent with requested payment methods
+    const paymentIntentParams = {
+      amount: amountInCents,
+      currency,
+      customer: user.customerId,
+      description: description || `Payment of ${amount} ${currency}`,
+      payment_method_types: paymentMethodTypes,
+      metadata: {
+        ...metadata,
+        userId: user._id.toString()
+      }
+    };
+    
+    // Add payment method options if configured
+    if (Object.keys(paymentMethodOptions).length > 0) {
+      paymentIntentParams.payment_method_options = paymentMethodOptions;
+    }
+    
+    // Add shipping options if provided
+    if (shippingOptions.length > 0) {
+      paymentIntentParams.shipping_options = shippingOptions.map(option => ({
+        shipping_rate_data: {
+          display_name: option.name,
+          type: 'fixed_amount',
+          fixed_amount: {
+            amount: option.amount * 100,
+            currency
+          },
+          delivery_estimate: option.estimatedDays ? {
+            minimum: { unit: 'business_day', value: option.estimatedDays.min || 1 },
+            maximum: { unit: 'business_day', value: option.estimatedDays.max || 5 }
+          } : undefined
+        }
+      }));
+    }
+
+    // Create the payment intent
+    const paymentIntent = await stripeClient.paymentIntents.create(paymentIntentParams);
+
+    // Generate payment configuration for various wallets
+    const paymentConfig = {
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id,
+      amount: amountInCents / 100,
+      currency,
+      supportedPaymentMethods: paymentMethods,
+      customer: {
+        id: user.customerId,
+        email: user.email
+      },
+      walletConfig: {
+        applePay: paymentMethods.includes('apple_pay') ? {
+          merchantId: process.env.APPLE_PAY_MERCHANT_ID || 'merchant.com.yourcompany.app',
+          merchantName: process.env.MERCHANT_NAME || 'Your Company',
+          countryCode: 'US'
+        } : null,
+        googlePay: paymentMethods.includes('google_pay') ? {
+          merchantId: process.env.GOOGLE_PAY_MERCHANT_ID || 'your-merchant-id',
+          merchantName: process.env.MERCHANT_NAME || 'Your Company'
+        } : null,
+        amazonPay: paymentMethods.includes('amazon_pay') ? {
+          merchantId: process.env.AMAZON_PAY_MERCHANT_ID || 'your-amazon-pay-id',
+          region: 'US' // Adjust for your region
+        } : null
+      }
+    };
+
+    res.status(200).json({
+      message: 'Payment intent created successfully',
+      paymentIntent: {
+        id: paymentIntent.id,
+        clientSecret: paymentIntent.client_secret,
+        amount: paymentIntent.amount / 100,
+        currency: paymentIntent.currency,
+        status: paymentIntent.status
+      },
+      paymentConfig
+    });
+  } catch (error) {
+    console.error('Error creating payment intent:', error);
+    res.status(500).json({ 
+      message: 'Error creating payment intent', 
+      error: error.message 
+    });
+  }
+});
+
+// Get digital wallet configuration (for frontend use) with long-lived cache
+app.get('/payment-methods/wallet-config', authenticateToken,  async (req, res) => {
+  try {
+    const walletConfig = {
+      applePay: {
+        enabled: !!process.env.APPLE_PAY_MERCHANT_ID,
+        merchantId: process.env.APPLE_PAY_MERCHANT_ID || 'merchant.com.yourcompany.app',
+        merchantName: process.env.MERCHANT_NAME || 'Your Company',
+        countryCode: 'US'
+      },
+      googlePay: {
+        enabled: !!process.env.GOOGLE_PAY_MERCHANT_ID, 
+        merchantId: process.env.GOOGLE_PAY_MERCHANT_ID || 'your-merchant-id',
+        merchantName: process.env.MERCHANT_NAME || 'Your Company',
+        environment: process.env.NODE_ENV === 'production' ? 'PRODUCTION' : 'TEST'
+      },
+      amazonPay: {
+        enabled: !!process.env.AMAZON_PAY_MERCHANT_ID,
+        merchantId: process.env.AMAZON_PAY_MERCHANT_ID || 'your-amazon-pay-id',
+        region: 'US' // Adjust for your region
+      }
+    };
+
+    res.status(200).json({
+      walletConfig,
+      supportedMethods: {
+        card: true,
+        applePay: walletConfig.applePay.enabled,
+        googlePay: walletConfig.googlePay.enabled,
+        amazonPay: walletConfig.amazonPay.enabled
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching wallet configuration:', error);
+    res.status(500).json({ 
+      message: 'Error fetching wallet configuration', 
+      error: error.message 
+    });
+  }
+});
+
+// Validate payment method availability for a particular browser/device
+app.post('/payment-methods/validate', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      method, 
+      userAgent, 
+      deviceType, 
+      amount, 
+      currency = 'usd' 
+    } = req.body;
+
+    // Simple validation logic based on user agent and device
+    const isIOS = userAgent?.includes('iPhone') || userAgent?.includes('iPad') || deviceType === 'ios';
+    const isAndroid = userAgent?.includes('Android') || deviceType === 'android';
+    
+    // Determine available methods
+    const availableMethods = {
+      card: true, // Credit/debit cards always available
+      apple_pay: isIOS && !!process.env.APPLE_PAY_MERCHANT_ID,
+      google_pay: isAndroid && !!process.env.GOOGLE_PAY_MERCHANT_ID,
+      amazon_pay: !!process.env.AMAZON_PAY_MERCHANT_ID
+    };
+
+    // Check if requested method is available
+    const isAvailable = method ? availableMethods[method] : true;
+    
+    // Get required Stripe configuration for client
+    const clientConfig = {
+      publishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
+      merchantName: process.env.MERCHANT_NAME,
+      supportedMethods: Object.keys(availableMethods).filter(m => availableMethods[m])
+    };
+
+    res.status(200).json({
+      isAvailable,
+      availableMethods,
+      clientConfig,
+      testMode: process.env.NODE_ENV !== 'production'
+    });
+  } catch (error) {
+    console.error('Error validating payment method:', error);
+    res.status(500).json({ 
+      message: 'Error validating payment method', 
+      error: error.message 
+    });
+  }
+});
 
 // Keep your server listening code at the very bottom of the file
 const port = process.env.PORT || 3000;

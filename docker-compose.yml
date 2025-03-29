@@ -13,6 +13,7 @@ services:
       - ./nginx/conf.d:/etc/nginx/conf.d
       - ./nginx/ssl:/etc/nginx/ssl
       - ./nginx/www:/var/www/html
+      - ./apple-pay-verification:/var/www/.well-known
     depends_on:
       - app
     networks:
