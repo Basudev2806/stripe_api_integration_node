@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  # Node.js application service
+  nginx:
+    image: nginx:alpine
+    container_name: stripe-api-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./nginx/www:/var/www/html
+    depends_on:
+      - app
+    networks:
+      - app-network
+
+  # Redis for caching and rate limiting
+  redis:
+    image: redis:alpine
+    container_name: stripe-api-redis
+    restart: always
+    networks:
+      - app-network
+
+  app:
+    build: .
+    container_name: stripe-api-app
+    restart: always
+    ports:
+      - "3000:3000"
+    depends_on:
+      - mongo
+      - redis
+    environment:
+      - PORT=3000
+      - MONGO_URI=mongodb://mongo:27017/stripe-api
+      - REDIS_URI=redis://redis:6379
+      - NODE_ENV=production
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+    volumes:
+      - ./:/usr/src/app
+      - /usr/src/app/node_modules
+    networks:
+      - app-network
+
+  # MongoDB service
+  mongo:
+    image: mongo:6.0
+    container_name: stripe-api-mongo
+    restart: always
+    volumes:
+      - mongo-data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - app-network
+
+  # MongoDB admin interface (optional)
+  mongo-express:
+    image: mongo-express
+    container_name: stripe-api-mongo-express
+    restart: always
+    ports:
+      - "8081:8081"
+    environment:
+      - ME_CONFIG_MONGODB_SERVER=mongo
+      - ME_CONFIG_MONGODB_PORT=27017
+    depends_on:
+      - mongo
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  mongo-data:
+    driver: local 
